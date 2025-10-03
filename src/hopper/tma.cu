@@ -70,15 +70,15 @@ __global__ void tma_kernel(const __grid_constant__ CUtensorMap tma_map, half* C,
         init_mbarrier(&empty, 1);
     }
     __syncthreads();
-
+    if(threadIdx.x == 0)
+        arrive(&empty);
     
     if(threadIdx.x == 0){ 
         expect_byte(&full, sizeof(half)*BK*BM);
         wait(&empty, 0);
-        asyn_load((half*)smem, &tma_map, &empty, 0, 0);
+        asyn_load((half*)smem, &tma_map, &full, 0, 0);
     }
-    if(threadIdx.x == 0)
-        arrive(&empty);
+
     if(threadIdx.x == 0)
         wait(&full,0);
 
@@ -86,34 +86,51 @@ __global__ void tma_kernel(const __grid_constant__ CUtensorMap tma_map, half* C,
         for(int i=0;i<BM;i++){
             if (i > 0)
                 printf("\n");
-            for(int j=0;j<BK;j++){
+            for(int j=0;j<BK;j+=8){
                 printf("%f\t",__half2float(smem[i][j]));
             }
         }
     }
+    printf("\n");
 }
 // The first dimension of the global shape is not divisible, 
 // and stride only records tensorRank-1, that is, the divisible dimension is ignored.
 template<int BM, int BK,int Swizzle>
-__host__ inline static CUtensorMap create_tensor_map(half* A, int M, int K){
-    CUtensorMap map;
+__host__ inline static void create_tensor_map(CUtensorMap* map ,half* A, int M, int K){
     void* gmem_address = (void*) A;
-    uint64_t globalDim[5] = {(uint64_t)K,(uint64_t)M,1,1,1};
-    uint64_t globalStride[5] = { uint64_t(sizeof(half)), uint64_t(sizeof(half) * K),0,0,0};
+    int P = 4 >> (Swizzle-1);
+    uint64_t globalDim[5] = {(uint64_t)(K/P),(uint64_t)M,uint64_t(P),1,1};
+    uint64_t globalStride[5] = { uint64_t(sizeof(half)), uint64_t(sizeof(half) * K),uint64_t((P==1 ? 0: (K/P)) * sizeof(half)),0,0};
 
-    uint32_t boxDim[5] = {(uint32_t)BM,(uint32_t)BK,1,1,1};
+    uint32_t boxDim[5] = {(uint32_t)(BK / P),(uint32_t)BM,(uint32_t)P,1,1};
     uint32_t boxStride[5] = {1 , 1, 1, 1, 1};
 
-    CUresult ret = cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 
-        5, gmem_address, globalDim, globalStride, boxDim, boxStride,
-         CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, 
+    CUresult ret = cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 
+        5, gmem_address, globalDim, globalStride + 1, boxDim, boxStride,
+         CU_TENSOR_MAP_INTERLEAVE_NONE, CUtensorMapSwizzle(Swizzle), 
          CU_TENSOR_MAP_L2_PROMOTION_NONE , CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     
-    assert(ret == CUDA_SUCCESS);
-    return map;
+
+    if (ret != CUDA_SUCCESS) {
+        const char* error_name = nullptr;
+        cuGetErrorName(ret, &error_name);
+        fprintf(stderr, "cuTensorMapEncodeTiled failed: %s\n", error_name);
+        exit(EXIT_FAILURE); 
+    }
 }
 
-CUtensorMap tma_map;
+/*
+typedef enum CUtensorMapSwizzle_enum {
+    CU_TENSOR_MAP_SWIZZLE_NONE = 0,
+    CU_TENSOR_MAP_SWIZZLE_32B,
+    CU_TENSOR_MAP_SWIZZLE_64B,
+    CU_TENSOR_MAP_SWIZZLE_128B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_32B_FLIP_8B,
+    CU_TENSOR_MAP_SWIZZLE_128B_ATOM_64B
+} CUtensorMapSwizzle;
+*/
+// CUtensorMap tma_map;
 int main(){
     const int M=64;
     const int K=64;
@@ -124,14 +141,15 @@ int main(){
     half* d_a, *d_c;
 
     for(int i=0;i<M*K;i++){
-        h_a[i] = (i / 8) % 8;
+        h_a[i] = (i / 8);
     }
     
     cudaMalloc(&d_a,sizeof(half) * M * K);
     cudaMalloc(&d_c,sizeof(half) * M * K);
-    tma_map = create_tensor_map<BM, BK, Swizzle>(d_a, M, K);
     cudaMemcpy(d_a, h_a, sizeof(half) * M * K, cudaMemcpyHostToDevice);
-    create_tensor_map<M,K,Swizzle>(d_a,M,K);
+    CUtensorMap tma_map;
+    create_tensor_map<BM, BK, Swizzle>(&tma_map,d_a, M, K);
+    
     tma_kernel<BM,BK><<<1,1>>>(tma_map,d_c,M,K);
     cudaDeviceSynchronize();
 
