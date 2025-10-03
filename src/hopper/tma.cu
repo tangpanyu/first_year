@@ -92,13 +92,14 @@ __global__ void tma_kernel(const __grid_constant__ CUtensorMap tma_map, half* C,
         }
     }
 }
-
+// The first dimension of the global shape is not divisible, 
+// and stride only records tensorRank-1, that is, the divisible dimension is ignored.
 template<int BM, int BK,int Swizzle>
 __host__ inline static CUtensorMap create_tensor_map(half* A, int M, int K){
     CUtensorMap map;
     void* gmem_address = (void*) A;
-    uint64_t globalDim[5] = {(uint64_t)M,(uint64_t)K,1,1,1};
-    uint64_t globalStride[5] = {uint64_t(K * sizeof(half)), uint64_t(sizeof(half)), 0,0,0};
+    uint64_t globalDim[5] = {(uint64_t)K,(uint64_t)M,1,1,1};
+    uint64_t globalStride[5] = { uint64_t(sizeof(half)), uint64_t(sizeof(half) * K),0,0,0};
 
     uint32_t boxDim[5] = {(uint32_t)BM,(uint32_t)BK,1,1,1};
     uint32_t boxStride[5] = {1 , 1, 1, 1, 1};
