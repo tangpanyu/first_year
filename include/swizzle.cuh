@@ -1,9 +1,3 @@
-#include <cstdint>
-#include <cstdio>
-#include <iostream>
-#include <cinttypes>
-#include <sys/types.h>
-
 #define HOST_DEVICE __host__ __device__ __forceinline__
 template<int BBits, int MBase, int SShift>
 struct Swizzle{
