@@ -47,8 +47,10 @@ struct Swizzle{
         return apply(static_cast<uint32_t>(offset));
     }
 
-    HOST_DEVICE static constexpr uint32_t operator()(uint32_t offset) const{
+    HOST_DEVICE static constexpr uint32_t operator()(uint32_t offset){
         return apply(offset);
     }
 };
+
+
 
