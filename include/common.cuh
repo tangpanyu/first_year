@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <config.cuh>
-
+#include <cudaTypedefs.h>
 #define HOST_DEVICE __host__ __device__ __forceinline__
 
 #define bf16 __nv_bfloat16
@@ -43,11 +43,11 @@ struct Swizzle{
         return (((shift << SandM) + mid)) + base;
     }
     template <class Offset>
-    HOST_DEVICE static const auto operator()(Offset offset){
+    HOST_DEVICE const auto operator()(Offset offset){
         return apply(static_cast<uint32_t>(offset));
     }
 
-    HOST_DEVICE static constexpr uint32_t operator()(uint32_t offset){
+    HOST_DEVICE constexpr uint32_t operator()(uint32_t offset){
         return apply(offset);
     }
 };
