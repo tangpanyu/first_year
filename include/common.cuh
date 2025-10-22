@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -26,9 +27,9 @@
 
 
 
-template<int BBits, int MBase, int SShift>
+template<int SShift,int BBits, int MBase>
 struct Swizzle{
-    static constexpr uint32_t num_s = BBits, num_b = MBase, num_m = SShift;
+    static constexpr uint32_t num_s = SShift, num_b = BBits, num_m = MBase;
     static constexpr uint32_t SandM = num_s + num_m;
     static constexpr uint32_t SsubB = num_s - num_b;
 
@@ -36,11 +37,12 @@ struct Swizzle{
     static constexpr uint32_t mid_msk = ((1U << SsubB) - 1) << SandM;
     static constexpr uint32_t base_msk = ((1U << num_b) - 1) << num_m;
 
-    HOST_DEVICE static constexpr uint32_t  apply(uint32_t offset){
+    HOST_DEVICE static constexpr uint32_t  apply(uint32_t tid){
+        uint32_t offset = (tid >> BBits << 7) + (((tid & ((1 << BBits) -1))) << MBase);
         uint32_t shift = (offset & shift_msk) >> SandM >> SsubB;
         uint32_t mid = (offset & mid_msk) >> SandM << (num_m + num_b);
         uint32_t base = (offset & base_msk) ^ (shift << num_m);
-        return (((shift << SandM) + mid)) + base;
+        return (((shift << SandM) + mid)) + base + (tid >> (SShift + BBits) << (SShift + BBits + MBase));
     }
     template <class Offset>
     HOST_DEVICE const auto operator()(Offset offset){

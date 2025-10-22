@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.cuh"
+#include <cstdint>
 
 
 DEVICE static void ldmatrix_x1(uint32_t r0,uint32_t addr){
@@ -19,7 +20,7 @@ DEVICE static void ldmatrix_x4(uint32_t r0,uint32_t r1,uint32_t r2,uint32_t r3,u
     asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3} [%4];\n"
                  : "=r"(r0),"=r"(r1),"=r"(r2),"=r"(r3)
                  : "r"(addr)
-    )
+    );
 }
 
 DEVICE static void hmma16816(uint32_t rd0, uint32_t rd1, uint32_t ra0, \
@@ -29,11 +30,10 @@ uint32_t ra1, uint32_t ra2, uint32_t ra3, uint32_t rb0, uint32_t rb1, uint32_t r
     : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1), "r"(rc0), "r"(rc1));
 }
 
-DEVICE static void cp_async(void* dst, void* src, uint32_t size){
+DEVICE static void cp_async_cg(uint32_t dst, void* src, uint32_t size){
     asm volatile("cp.async.cg.shared::cta.global [%0], [%1] , %2;\n"
     ::
-    "r"(dst), "r"(src), "n"(size)
-)
+    "r"(dst), "r"(src), "n"(size));
 }
 
 DEVICE static void cp_async_commit(){
@@ -42,7 +42,6 @@ DEVICE static void cp_async_commit(){
 
 DEVICE static void cp_async_wait_group(uint32_t size){
     asm volatile("cp.async.wait_group %0;\n"
-    :: "n"(size)
-)
+    :: "n"(size));
 }
 

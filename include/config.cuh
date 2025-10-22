@@ -3,9 +3,9 @@
 #define DEVICE __device__ __forceinline__
 #define bf16 __nv_bfloat16
 
-#define BM 16 // mma shape
-#define BN 8
-#define BK 16
+#define MM 16 // mma shape
+#define MN 16
+#define MK 16
 
 #define STAGE_K 32 // 一个stage加载的K,其中stageM和stageN和BM,BN相同，一个stage加载的是A16*32 ，B 32* 8
 
