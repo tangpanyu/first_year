@@ -4,8 +4,11 @@
 
 #include <cstdint>
 
-#define FETCH_DATA(dst, src, index) reinterpret_cast<float4*>(&dst)[0] = (reinterpret_cast<const float4* >(src))[index]
-#define STORE_DATA(dst, src, index) (reinterpret_cast<float4*>(dst))[index] = reinterpret_cast<float4*>(&src)[0]
+// 每个warp负责加载一个16*16的矩阵，也是计算一个16*8*16 * 2的矩阵。
+// block的形状是 32 * 32的
+// 考虑的MNK都是4096的形状
+// block的循环方式，BM是32，就从左到右再到左，
+
 __global__ void mma_gemm_base(const bf16* A, const bf16* B, bf16* C,const int M, const int N, const int K){
     __shared__ bf16 sAB[];
 
@@ -14,15 +17,18 @@ __global__ void mma_gemm_base(const bf16* A, const bf16* B, bf16* C,const int M,
 
     uint32_t warp_id = threadIdx.x << 5;
     uint32_t lane_id = threadIdx.x & 31;
+    const bf16* block_base_ga, *block_base_gb, *block_base_gc;
 
-    const bf16* block_base_ga = A + blockIdx.y * BLOCK_M;
-    const bf16* block_base_gb = B + blockIdx.x * BLOCK_N;
+    block_base_ga = A + blockIdx.y * BM * K;
 
-    const bf16* warp_base_ga = block_base_ga + (warp_id >> 1) * MM * K + (warp_id & 1) * MK ;
-    const bf16* warp_base_gb = block_base_gb + (warp_id >> 1) * MN * K + (warp_id & 1) * MK ;
-
-    bf16* thread_base_ga = (bf16*)warp_base_ga + (lane_id & 16) * K + (lane_id >> 4) * 8 ;
-    bf16* thread_base_gb = (bf16*)warp_base_gb + (lane_id & 16) * K + (lane_id >> 4) * 8 ;
+    if( blockIdx.y & 1){
+        block_base_gb = B + (blockDim.x - 1 - blockIdx.x) * BN * K;
+        block_base_gc = C + blockIdx.y * BM * N +  (blockDim.x - 1 -blockIdx.x)* BN;
+    }
+    else{
+        block_base_gb = B + blockIdx.x* BN * K;
+        block_base_gc = C + blockIdx.y * BM * N +  blockIdx.x* BN;
+    }
 
     bf16 RA[4];
     bf16 RB[2][2];
@@ -33,19 +39,42 @@ __global__ void mma_gemm_base(const bf16* A, const bf16* B, bf16* C,const int M,
         for(int j = 0; j < 2; ++j)
             RC[i][j] = 0;
 
+    const bf16* warp_base_ga = block_base_ga + (warp_id >> 1) * MM * K + (warp_id & 1) * MK;
+    const bf16* warp_base_gb = block_base_gb + (warp_id >> 1) * MN * K + (warp_id & 1) * MK;
+#pragma unroll
+    for(int iter =0 ;iter < K /BK; ++iter){
 
-    uint32_t sA = __cvta_generic_to_shared(sAB);
-    uint32_t sB = sA + MM * BLOCK_K * sizeof(bf16);
+        warp_base_ga += (iter * BK);
+        warp_base_gb += (iter * BK);
 
-    // 取数据到smem
+        bf16* thread_base_ga = (bf16*)warp_base_ga + (lane_id & 15) * K + (lane_id >> 4) * 8 ;
+        bf16* thread_base_gb = (bf16*)warp_base_gb + (lane_id & 15) * K + (lane_id >> 4) * 8 ; // 8 * 8 的矩阵 8个线程加载，得改一下。
 
-    cp_async_cg(sA + threadIdx.x * 16, thread_base_ga ,16);
-    cp_async_cg(sB + threadIdx.x * 16, thread_base_gb ,16);
+        uint32_t thread_base_sa = __cvta_generic_to_shared(sAB + threadIdx.x * 8);// address after swizzle;
+        uint32_t thread_base_sb = __cvta_generic_to_shared(sAB + BM * BK +  threadIdx.x * 8); 
 
-    cp_async_commit();
-    cp_async_wait_group(0);
+        cp_async_cg(thread_base_sa, thread_base_ga ,16);
+        cp_async_cg(thread_base_sb, thread_base_gb ,16);
 
-    __syncthreads();
+        cp_async_commit();
+        cp_async_wait_group(0);
+        __syncthreads();
+
+        ldmatrix_x4(RA[0], RA[1], RA[2], RA[3], __cvta_generic_to_shared(sAB + lane_id));
+        ldmatrix_x4(RB[0][0], RB[0][1], RB[1][0], RB[1][1], __cvta_generic_to_shared(sAB + BM * BK + lane_id));
+
+        hmma16816(RC[0][0], RC[0][1], RA[0], RA[1], RA[2], RA[3], RB[0][0], RB[0][1], RC[0][0], RC[0][1]);
+        hmma16816(RC[1][0], RC[1][1], RA[0], RA[1], RA[2], RA[3], RB[1][0], RB[1][1], RC[1][0], RC[1][1]);
+
+        ldmatrix_x4(RA[0], RA[1], RA[2], RA[3], thread_base_sa + MM * MK *16);
+        ldmatrix_x4(RB[0][0], RB[0][1], RB[1][0], RB[1][1], thread_base_sb + MN * MK *16);
+
+        hmma16816(RC[0][0], RC[0][1], RA[0], RA[1], RA[2], RA[3], RB[0][0], RB[0][1], RC[0][0], RC[0][1]);
+        hmma16816(RC[1][0], RC[1][1], RA[0], RA[1], RA[2], RA[3], RB[1][0], RB[1][1], RC[1][0], RC[1][1]);
+
+    }
+
+
 
     
 
