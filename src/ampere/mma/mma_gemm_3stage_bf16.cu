@@ -1,4 +1,5 @@
 
+#include <cuda_runtime.h>
 #include <common.cuh>
 #include <cstdint>
 #include <mma_ptx.cuh>
@@ -16,6 +17,7 @@ do { \
         exit(EXIT_FAILURE); \
     } \
 } while(0)
+
 /*
 我想取64x64的，因为这样硬件也能做两层流水，block launch的开销就能抵消，如果不做就得干等了。
 这样的话可以做3层流水，硬件两层流水了。但是ILP会低一点，得试一下。
@@ -136,7 +138,7 @@ struct SMem {
     alignas(128) half B[BK*BN*STAGES];
 };
 template<int NUM_THREADS, int NUM_SM>
-__global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half* const __restrict__ B, half* __restrict__ C,const int M, const int N, const int K){
+__global__ void __maxnreg__(128) mma_gemm_xstage_f16(const half* const __restrict__ A, const half* const __restrict__ B, half* __restrict__ C,const int M, const int N, const int K){
     
     extern __shared__ __align__(128) uint8_t smem[];
     SMem &s = *reinterpret_cast<SMem*>(smem);
@@ -170,7 +172,7 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
         uint32_t s_stage_w = 0,s_stage_r = 0;
     
         #pragma unroll
-        for(int k = 0; k < STAGES - 1; ++k,++s_stage_w){
+        for(int k = 0; k < STAGES - 4; ++k,++s_stage_w){
             #pragma unroll
             for(int i = 0; i < 4; i++){ // 4 先写死
                 //  BM * BK 是一个block的块， MM*BK是一个加载的块，可以看作是 i* warps * warpsize * 8
@@ -213,16 +215,17 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
 
             
             // smem中不存在行号要求，以为都是0swizzle的，所以只需要定位块，和定位块内地址就行了，块内地址就是lane_id * 8
-            uint32_t offset =  s_stage_r * BM * BK + warp_a_idx * WM * BK + lane_id * 8;
+            // 共享内存定位，首先定位哪个stage块，然后定位块内的哪次加载，然后定位线程的加载位置，还缺内存
+            uint32_t s_thread_offset =  s_stage_r * BM * BK + warp_a_idx * WM * BK + lane_id * 8;
 
             #pragma unroll
             for(int i = 0; i < 4; i++){
                 
                 LDMATRIX_X4(RA[0][i][0], RA[0][i][1], RA[0][i][2], RA[0][i][3], \
-                    __cvta_generic_to_shared(sA + offset + i * MM * MK)); 
+                    (uint32_t)__cvta_generic_to_shared(sA + s_thread_offset + i * MM * MK)); 
 
                 LDMATRIX_X4(RB[0][i][0], RB[0][i][2], RB[0][i][1], RB[0][i][3], \
-                    __cvta_generic_to_shared(sB + offset + i * MN * MK)); 
+                    (uint32_t)__cvta_generic_to_shared(sB + s_thread_offset + i * MM * MK)); 
             }
 
             #pragma unroll
@@ -244,10 +247,10 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
                 // smem中不存在行号要求，以为都是0swizzle的，所以只需要定位块，和定位块内地址就行了，块内地址就是lane_id * 8
                 
                 LDMATRIX_X4(RA[1][i][0], RA[1][i][1], RA[1][i][2], RA[1][i][3], \
-                    __cvta_generic_to_shared(sA + offset + i * MM * MK)); 
+                    (uint32_t)__cvta_generic_to_shared(sA + MM * BK + s_thread_offset + i * MM * MK)); 
 
                 LDMATRIX_X4(RB[1][i][0], RB[1][i][2], RB[1][i][1], RB[1][i][3], \
-                    __cvta_generic_to_shared(sB + offset + i * MN * MK)); 
+                    (uint32_t)__cvta_generic_to_shared(sB + MK * BK + s_thread_offset + i * MM * MK)); 
             }
 
             #pragma unroll
@@ -255,7 +258,7 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
                 
                 HMMA16816(  RC[1][0],RC[1][1],
                             RA[0][i][0],RA[0][i][1],RA[0][i][2],RA[0][i][3],
-                            RB[1][i][0],RB[0][1][1],
+                            RB[1][i][0],RB[1][i][1],
                             RC[1][0],RC[1][1]);
 
                 HMMA16816(  RC[1][2],RC[1][3],
@@ -297,7 +300,7 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
         }
         
         for(int i = 0; i < 4; i++){
-            uint32_t* sC = (uint32_t*)sA + warp_id * WM * (WM >> 1) + i * MM * (MN >> 1);
+            uint32_t* sC = (uint32_t*)(sA + warp_id * WM * WM + i * MM * MK);
 
             sC[lane_id] = RC[i][0];
             sC[lane_id + 32] = RC[i][1];
@@ -306,7 +309,11 @@ __global__ void mma_gemm_xstage_f16(const half* const __restrict__ A, const half
         }
         __syncthreads();
 
-        // int4* sC = (int4*)sA + 
+        uint32_t sc_thread_offset = (warp_id * warpSize + lane_id) * 8;
+        for(int i=0; i < 1; i++){
+            reinterpret_cast<int4*>(block_base_gc + ((i >> 1) * WM + (warp_id >> 1) * MM + (lane_id & 15))*K
+            + (warp_id & 1) * MK + (lane_id >> 4) * MN)[0] = reinterpret_cast<int4*>(sA + sc_thread_offset + i * WM * WK)[0];
+        }
     }
 }
 
@@ -399,9 +406,10 @@ int main(){
     checkRuntime(cudaMalloc((void**)&A,M*K*sizeof(T)));
     checkRuntime(cudaMalloc((void**)&B,K*N*sizeof(T)));
     checkRuntime(cudaMalloc((void**)&C,M*N*sizeof(T)));
-    checkRuntime(cudaMalloc((void**)&D,M*N*sizeof(T)));
+    
     checkRuntime(cudaMallocHost((void**)&h_c,M*N*sizeof(T)));
-    checkRuntime(cudaMallocHost((void**)&h_d,M*N*sizeof(T)));
+    // checkRuntime(cudaMalloc((void**)&D,M*N*sizeof(T)));
+    // checkRuntime(cudaMallocHost((void**)&h_d,M*N*sizeof(T)));
     for(size_t i=0;i<M;++i){
         for(size_t j=0;j<K;++j){
             h_a[i*K+j]= __float2half(dis(gen));
@@ -415,16 +423,16 @@ int main(){
 
     checkRuntime(cudaMemcpy(A,h_a.get(),M*K*sizeof(T),cudaMemcpyHostToDevice));
     checkRuntime(cudaMemcpy(B,h_b.get(),N*K*sizeof(T),cudaMemcpyHostToDevice));
-    size_t smem_max_size = ( BM * BK + BN * BK ) * sizeof(half);
+    size_t smem_max_size = ( BM * BK + BN * BK ) * sizeof(half) * STAGES;
     printf("(M+BM -1 ) / BM = %d ,(N+BN -1) / BN = %d \n" ,(M+BM -1 ) / BM ,(N+BN -1) / BN);
-    dim3 grid((M+BM -1 ) / BM ,(N+BN -1) / BN);
-    dim3 block(128,1,1);
-    // cudaFuncSetAttribute(mma_gemm_base, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max_size);
+    dim3 grid(46 * 2,1);
+    dim3 block(32,4,1);
+    cudaFuncSetAttribute(mma_gemm_xstage_f16<128, 46 * 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max_size);
     dim3 block_size(32, 32, 1);
-    for(int i=0;i<2;++i)
-        cuda_hgemm<<<grid, block_size>>>(A, B, D, M, N, K);
-    cudaDeviceSynchronize();
-    mma_gemm_base<<< grid,block,smem_max_size>>> (A,B,C,M,N,K);
+    // for(int i=0;i<2;++i)
+    //     cuda_hgemm<<<grid, block_size>>>(A, B, D, M, N, K);
+    // cudaDeviceSynchronize();
+    mma_gemm_xstage_f16<128, 46 * 2><<< grid,block,smem_max_size>>> (A,B,C,M,N,K);
 
     cudaDeviceSynchronize();
 
