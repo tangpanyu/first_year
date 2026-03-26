@@ -93,16 +93,22 @@ __global__ void tma_kernel(const __grid_constant__ CUtensorMap tma_map, half* C,
     }
     printf("\n");
 }
-// The first dimension of the global shape is not divisible, 
-// and stride only records tensorRank-1, that is, the divisible dimension is ignored.
+
+// The first dimension of the global shape must be col-major
+// because the TMA is designed for col-major access and 
+// the first dimension of the global stride must equal 1
+
+// The boxDim[0] must be less or equal to the swizzle factor, less is not implemented
+// cp.async.bulk.tensor.nd the idx parameter contorl the global load idx
+// so global dim is not important, boxDim is keys
 template<int BM, int BK,int Swizzle>
 __host__ inline static void create_tensor_map(CUtensorMap* map ,half* A, int M, int K){
     void* gmem_address = (void*) A;
-    int P = 4 >> (Swizzle-1);
-    uint64_t globalDim[5] = {(uint64_t)(K/P),(uint64_t)M,uint64_t(P),1,1};
-    uint64_t globalStride[5] = { uint64_t(sizeof(half)), uint64_t(sizeof(half) * K),uint64_t((P==1 ? 0: (K/P)) * sizeof(half)),0,0};
+    // int P = 4 >> (Swizzle-1);
+    uint64_t globalDim[5] = {(uint64_t)(K),(uint64_t)M,1,1,1};
+    uint64_t globalStride[5] = { uint64_t(sizeof(half)), uint64_t(sizeof(half) * K),0,0,0};
 
-    uint32_t boxDim[5] = {(uint32_t)(BK / P),(uint32_t)BM,(uint32_t)P,1,1};
+    uint32_t boxDim[5] = {(uint32_t)(BK),(uint32_t)BM,1,1,1};
     uint32_t boxStride[5] = {1 , 1, 1, 1, 1};
 
     CUresult ret = cuTensorMapEncodeTiled(map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 
@@ -135,8 +141,8 @@ int main(){
     const int M=64;
     const int K=64;
     const int BM=64;
-    const int BK=64;
-    const int Swizzle=3;
+    const int BK=32;
+    const int Swizzle=2;
     half* h_a = new half[M*K];
     half* d_a, *d_c;
 
