@@ -53,7 +53,7 @@ class ModelArgs:
         mscale (float): Scaling factor for extended attention.
     """
     max_batch_size: int = 8
-    max_seq_len: int = 4096 * 4
+    max_seq_len: int = 4096
     dtype: Literal["bf16", "fp8"] = "bf16"
     scale_fmt: Optional[str] = None
     vocab_size: int = 102400
@@ -305,12 +305,12 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
     Returns:
         torch.Tensor: Precomputed complex exponential values for positional embeddings.
     """
-    dim = args.qk_rope_head_dim
-    seqlen = args.max_seq_len
-    beta_fast = args.beta_fast
-    beta_slow = args.beta_slow
-    base = args.rope_theta
-    factor = args.rope_factor
+    dim = args.qk_rope_head_dim # 64
+    seqlen = args.max_seq_len # 4096 * 4
+    beta_fast = args.beta_fast # 32
+    beta_slow = args.beta_slow # 1
+    base = args.rope_theta # 10000.0
+    factor = args.rope_factor # 40
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
         """
@@ -460,14 +460,17 @@ class MLA(nn.Module):
         print(f"mla.x: {x.shape} , freqs_cis: {freqs_cis.shape}")
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+        # 细节一： q的位置编码不是在隐藏层输入上，而是经过低秩投影上
         if self.q_lora_rank == 0:
             q = self.wq(x) #[bsz,seqlen,16 * (128 + 64)]
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        # 细节二： q的位置编码每个head都不相同
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim) #[bsz,seqlen,16,128 + 64]
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) #[bsz,seqlen,16,128] [bsz,seqlen,16,64]
         q_pe = apply_rotary_emb(q_pe, freqs_cis) #freqs_cis和apply_rotary_emb做了什么？
         kv = self.wkv_a(x) #[bsz,seqlen,512 + 64]
+        # 细节三：k的位置编码在隐藏层输入上，且多头公用一个位置编码
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) #[bsz,seqlen,512] [bsz,seqlen,64]
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         if attn_impl == "naive":
@@ -478,20 +481,25 @@ class MLA(nn.Module):
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
             self.k_cache[:bsz, start_pos:end_pos] = k
             self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale # 他的形状描述是由所有s的一个h的d维向量组成一个head，后面同理，只不过把s换成t了
-            # 所以只需要用遍历s的一个head向量乘t的每个head，就能得到一个句子向量的分数，存在一个向量t中，也就是后面的t，再对它softmax就行了。
-            # 为什么不需要转置，因为Q@K_T的K不转置的矩阵乘是需要t是contiguous，转置乘了则变成d的contiguous，正好。
-            # 但是P@V是需要t是contiguous，但是是d的contiguous，所以需要转置。
-            # 总结：转置是因为最后一维不是contiguous，取元素的按stride取成本高。
+            # 这里描述的是q@k^T,规约维度是d，转置与否无所谓，保证在tensor core中的规约维度是k即可
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale 
         else:
+            # 细节四： wkv_b是将kv的低秩投影转化到需要的kv维度上，其维度是[low_rank_dim, num_heads x (nope_k_dim + v_dim)]^T,权重和输入不一样
+            # 下面要做view操作，写明白比较好，所以说下面的vie只是把num_heads和dim拆分了
             wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank) #[16,128+128,512]
+            # 细节五： Linear操作是y = xw^t，如果QK^T，w权重可以在加载权重前先计算完成，这里Q直接乘K^T的矩阵
+            # 然而这里是的W需要做转置，因为torch里面存的就是w^T,现在需要的是W不需要动，
+            # heads维度可以不动，因为训练就是这样的，所以没问题
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]) #[bsz,seqlen,16,128]@[16,128,512] = [bsz,seqlen,16,512] 乘wkv_b的上半部分并且不需要对权重转置
+            # 细节六：kv cache存的是kv的低秩投影，其维度是[bsz, seq_len, low_rank_dim]和k_pe，总体上相对于每个头都存省很多，k和v共用的
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            # 细节七：矩阵乘分块，将q和K的low_rank乘，再加上他的位置编码乘
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) + # 乘k需要对k进行转置，但是k是k-major，也就是c是contiguous的，所以说没用代价
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale #[bsz,seqlen,16,seqlen] 为什么直接加了位置编码?
             print(f"scores: {scores.shape}")
+            #细节八： 一个只有0和负无穷的类似对角矩阵，表示自注意力只关注当前位置之前的token
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
@@ -499,9 +507,11 @@ class MLA(nn.Module):
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
             # 确实需要对v转置，因为P@V，是P行乘V列，也就是说：t是变化最快的维度，但是一般在d上contiguous，所以需要转变为t是contiguous。
         else:
+            # 细节九：再乘kv cache，因为k和v共用一个low_rank C矩阵；
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos]) #[bsz,seqlen,16,seqlen]@[bsz,seqlen,512] = [bsz,seqlen,16,512] 
-            
+            # 细节十： 乘V = cw^T的升维矩阵，所以要乘这个W，但是torch存的是w^T，所以需要转置
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:]) #[bsz,seqlen,16,512]@[16,-128:,512] = [bsz,seqlen,16,128]
+        # 细节十一：在推理阶段，可以直接让V的W先左乘Wo
         x = self.wo(x.flatten(2))
         return x
 
